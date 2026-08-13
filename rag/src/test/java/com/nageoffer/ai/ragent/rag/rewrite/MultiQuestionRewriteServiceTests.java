@@ -17,6 +17,7 @@
 
 package com.nageoffer.ai.ragent.rag.rewrite;
 
+import com.nageoffer.ai.ragent.framework.convention.ChatMessage;
 import com.nageoffer.ai.ragent.rag.core.rewrite.MultiQuestionRewriteService;
 import com.nageoffer.ai.ragent.rag.core.rewrite.RewriteResult;
 import lombok.RequiredArgsConstructor;
@@ -52,5 +53,19 @@ public class MultiQuestionRewriteServiceTests {
         boolean hasTaobao = subs.stream().anyMatch(s -> s.contains("淘宝"));
         boolean hasTmall = subs.stream().anyMatch(s -> s.contains("天猫"));
         Assertions.assertTrue(hasTaobao && hasTmall, "期望子问题能覆盖并列主体：淘宝和天猫");
+    }
+
+    @Test
+    public void shouldKeepFeedbackInputAsIsEvenWithTopicHistory() {
+        // 复现：历史聊了发票话题后，用户发"回答的不错"，曾被改写为"集团的发票情况"
+        List<ChatMessage> history = List.of(
+                ChatMessage.user("集团的发票情况怎么样"),
+                ChatMessage.assistant("集团当前共有三家公司开票，详情请见开票信息文档……")
+        );
+
+        RewriteResult result = multiQuestionRewriteService.rewriteWithSplit("回答的不错", history);
+
+        Assertions.assertEquals("回答的不错", result.rewrittenQuestion());
+        Assertions.assertEquals(List.of("回答的不错"), result.subQuestions());
     }
 }

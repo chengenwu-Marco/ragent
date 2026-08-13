@@ -38,6 +38,7 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.QUERY_REWRITE_AND_SPLIT_PROMPT_PATH;
@@ -49,6 +50,23 @@ import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.QUERY_REWRITE_AND
 @Service
 @RequiredArgsConstructor
 public class MultiQuestionRewriteService implements QueryRewriteService {
+
+    /**
+     * 疑问标记：命中说明输入是提问，不做闲聊守卫拦截
+     */
+    private static final Pattern QUESTION_MARKER_PATTERN = Pattern.compile("[?？吗呢么怎么如何什么为什么为啥哪多少几]");
+
+    /**
+     * 反馈/闲聊关键词：短输入命中且无疑问标记时，视为非问题类输入
+     */
+    private static final Pattern CHITCHAT_KEYWORD_PATTERN = Pattern.compile(
+            "不错|好的|谢谢|多谢|辛苦|收到|明白|了解|知道|可以|挺好|很棒|很好|厉害|再见|拜拜|你好|[Oo][Kk]");
+
+    /**
+     * 请求类前缀：以这些词开头的输入是陈述式提问，不做闲聊守卫拦截
+     */
+    private static final Pattern REQUEST_PREFIX_PATTERN = Pattern.compile(
+            "^(请|帮我|麻烦|想知道|想了解|请问|问下|讲讲|说说|介绍一下|怎么)");
 
     private final LLMService llmService;
     private final RAGConfigProperties ragConfigProperties;
@@ -69,13 +87,17 @@ public class MultiQuestionRewriteService implements QueryRewriteService {
     @Override
     @RagTraceNode(name = "query-rewrite-and-split", type = "REWRITE")
     public RewriteResult rewriteWithSplit(String userQuestion, List<ChatMessage> history) {
-        if (!ragConfigProperties.getQueryRewriteEnabled()) {
-            String normalized = queryTermMappingService.normalize(userQuestion);
-            List<String> subs = ruleBasedSplit(normalized);
-            return new RewriteResult(normalized, subs);
+        String normalizedQuestion = queryTermMappingService.normalize(userQuestion);
+
+        RewriteResult nonQuestionResult = skipIfNonQuestion(normalizedQuestion);
+        if (nonQuestionResult != null) {
+            return nonQuestionResult;
         }
 
-        String normalizedQuestion = queryTermMappingService.normalize(userQuestion);
+        if (!ragConfigProperties.getQueryRewriteEnabled()) {
+            List<String> subs = ruleBasedSplit(normalizedQuestion);
+            return new RewriteResult(normalizedQuestion, subs);
+        }
 
         return callLLMRewriteAndSplit(normalizedQuestion, userQuestion, history);
     }
@@ -84,18 +106,56 @@ public class MultiQuestionRewriteService implements QueryRewriteService {
      * 先用默认改写做归一化，再进行多问句拆分。
      */
     private RewriteResult rewriteAndSplit(String userQuestion) {
-        // 开关关闭：直接做规则归一化 + 规则拆分
-        if (!ragConfigProperties.getQueryRewriteEnabled()) {
-            String normalized = queryTermMappingService.normalize(userQuestion);
-            List<String> subs = ruleBasedSplit(normalized);
-            return new RewriteResult(normalized, subs);
-        }
-
         String normalizedQuestion = queryTermMappingService.normalize(userQuestion);
 
-        return callLLMRewriteAndSplit(normalizedQuestion, userQuestion, List.of());
+        RewriteResult nonQuestionResult = skipIfNonQuestion(normalizedQuestion);
+        if (nonQuestionResult != null) {
+            return nonQuestionResult;
+        }
 
-        // 兜底：使用归一化结果 + 规则拆分
+        // 开关关闭：直接做规则归一化 + 规则拆分
+        if (!ragConfigProperties.getQueryRewriteEnabled()) {
+            List<String> subs = ruleBasedSplit(normalizedQuestion);
+            return new RewriteResult(normalizedQuestion, subs);
+        }
+
+        return callLLMRewriteAndSplit(normalizedQuestion, userQuestion, List.of());
+    }
+
+    /**
+     * 非问题类输入（反馈、评价、闲聊）原样返回，不调用 LLM 改写。
+     * <p>
+     * 否则 LLM 会结合会话历史把"回答的不错"这类反馈误改写成历史话题
+     * （如"集团的发票情况"），导致后续检索命中无关知识库。
+     */
+    private RewriteResult skipIfNonQuestion(String normalizedQuestion) {
+        if (!isNonQuestionInput(normalizedQuestion)) {
+            return null;
+        }
+        log.info("检测到非问题类输入，跳过查询改写，原样返回：{}", normalizedQuestion);
+        return new RewriteResult(normalizedQuestion, List.of(normalizedQuestion));
+    }
+
+    /**
+     * 短输入、无疑问标记且命中反馈/闲聊关键词时判定为非问题类输入。
+     * <p>
+     * 长度上限内保守匹配：即使误拦截陈述式提问，也只是跳过改写，
+     * 原始问题仍会进入意图识别与检索，不会导致答非所问。
+     */
+    private boolean isNonQuestionInput(String normalizedQuestion) {
+        if (StrUtil.isBlank(normalizedQuestion)) {
+            return true;
+        }
+        if (normalizedQuestion.length() > 20) {
+            return false;
+        }
+        if (REQUEST_PREFIX_PATTERN.matcher(normalizedQuestion).find()) {
+            return false;
+        }
+        if (QUESTION_MARKER_PATTERN.matcher(normalizedQuestion).find()) {
+            return false;
+        }
+        return CHITCHAT_KEYWORD_PATTERN.matcher(normalizedQuestion).find();
     }
 
     private RewriteResult callLLMRewriteAndSplit(String normalizedQuestion,
